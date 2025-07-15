@@ -9,6 +9,7 @@
     <h1>Testing the Flask PORTOB Backend</h1>
     <input type="text" id="textInput" placeholder="Please INput Your Fucking Query">
     <button id="submitBtn">Submit Query</button>
+    <div id="response"></div>
     <script>
         const textInput=document.getElementById("textInput");
         const submitBtn=document.getElementById("submitBtn");
@@ -18,20 +19,40 @@
             if (prompt) {   
                 fetch("http://127.0.0.1:8000/api/chat",{
                     method:"POST",
-                    "content-type":"application/json",
+                    headers:{
+                        "content-type":"application/json"
+                    },
                     body:JSON.stringify({
                         message:prompt,
-                        conversation_id:1,
                     })
                 })
                 .then(res=>res.json())
-                .then(data=>console.log(data))
+                .then(data=>{
+                    console.log(data)
+                    localStorage.setItem("conversation_id",data.conversation_id)
+                    document.getElementById("response").innerHTML=data.response;
+                })
                 .catch(err=>console.log(err))
 
             }else{
                 alert("PLease Provide A MEssage");
             }
         })
+
+            setInterval(() => {
+                fetch("http://127.0.0.1:8000/api/end-conversation", {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({
+                    conversation_id: localStorage.getItem("conversation_id"),
+                    user_email: "abusayed@gmail.com"
+                  })
+                })
+                  .then(res => res.json())
+                  .then(data => console.log("Snapshot sent", data))
+                  .catch(err => console.log(err));
+              }, 60 * 1000);
+
     </script>
 </body>
 </html>

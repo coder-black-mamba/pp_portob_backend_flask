@@ -14,7 +14,8 @@ import dotenv
 dotenv.load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+# Allow all origins and common HTTP methods for frontend running on localhost or file://
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
 # Configuration - Add these to your environment variables
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', 'your-groq-api-key')
@@ -56,7 +57,7 @@ class ChatResponse:
             result["error"] = self.error
         return result
 
-def call_groq_api(messages: List[Dict]) -> str:
+def call_groq_api(message):
     """Call Groq API using official Python library"""
     if not groq_client:
         raise Exception("Groq client not initialized. Please check your API key.")
@@ -64,11 +65,31 @@ def call_groq_api(messages: List[Dict]) -> str:
     try:
         print(f"Making API request using Groq Python library")
         print(f"Using model: {GROQ_MODEL}")
-        print(f"Message count: {len(messages)}")
+        # Log the type and size of the incoming message for easier debugging
+        if isinstance(message, list):
+            print(f"Incoming message is a list with {len(message)} item(s)")
+        else:
+            print(f"Incoming message is a str of length {len(message)}")
         
         # Create chat completion using Groq client
         chat_completion = groq_client.chat.completions.create(
-            messages=messages,
+            # Build the prompt. If `message` is already a list of chat dictionaries, we
+            # append it after the system prompt. Otherwise we wrap the single user
+            # message in the expected format.
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an assistant for Abu Sayed's developer portfolio. "
+                        "You are talking to a potential HR, manager, or developer who "
+                        "is visiting the portfolio and helping them with their queries. "
+                        "You should be professional and provide accurate information. "
+                        "Return responses in markdown format."
+                    ),
+                }
+            ] + (
+                message if isinstance(message, list) else [{"role": "user", "content": message}]
+            ),
             model=GROQ_MODEL,
             max_tokens=1000,
             temperature=0.7,
@@ -116,6 +137,13 @@ def get_available_models() -> List[str]:
             'llama-3.2-1b-preview'
         ]
 
+def send_contact_email(from_email: str, message: str, name: str | None = None):
+    """Wrapper around send_email to send portfolio contact."""
+    subject = "Portfolio contact from {}".format(name or from_email or "visitor")
+    body = f"Message from {name or 'visitor'} (email: {from_email}):\n\n{message}"
+    return send_email(subject, body, user_email=from_email)
+
+
 def send_email(subject: str, body: str, user_email: str = None):
     """Send email notification to admin"""
     try:
@@ -154,6 +182,23 @@ def detect_contact_intent(message: str) -> bool:
     message_lower = message.lower()
     return any(keyword in message_lower for keyword in contact_keywords)
 
+import re
+
+def extract_contact_info(message: str) -> dict:
+    """Extract basic contact info such as email and name from the message."""
+    info = {}
+    # Email regex
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+", message)
+    if email_match:
+        info["email"] = email_match.group(0)
+
+    # Very naive name extraction – looks for patterns like "my name is X" or "I am X"
+    name_match = re.search(r"(?:my name is|i am|this is)\s+([A-Za-z\s]{2,40})", message, re.IGNORECASE)
+    if name_match:
+        info["name"] = name_match.group(1).strip()
+    return info
+
+
 def extract_contact_message(message: str) -> str:
     """Extract the actual message user wants to send"""
     # Simple extraction - in production, you might want more sophisticated parsing
@@ -170,97 +215,60 @@ def extract_contact_message(message: str) -> str:
 @app.route('/api/chat', methods=['POST'])
 def chat():
     try:
-        print(request.data)
         data = request.get_json()
-        
-        if not data or 'message' not in data:
+        print(data)
+
+        message=data.get("message")
+        conversation_id=data.get("conversation_id")
+        user_email=data.get("user_email")
+
+        if not message:
             return jsonify(ChatResponse(
                 response="",
                 error="Message is required"
             ).to_dict()), 400
         
-        user_message = data['message']
-        conversation_id = data.get('conversation_id')
-        user_email = data.get('user_email')  # Optional user email
         
-        # Create new conversation if not provided
+        chat_response = call_groq_api(message)
+        
+
+        # --- Persist conversation ----
         if not conversation_id:
             conversation_id = str(uuid.uuid4())
-            conversations[conversation_id] = []
-            conversation_metadata[conversation_id] = {
-                'created_at': datetime.now().isoformat(),
-                'user_email': user_email,
-                'model': GROQ_MODEL
-            }
-        
-        # Check if user wants to contact admin
-        if detect_contact_intent(user_message):
-            contact_message = extract_contact_message(user_message)
-            
-            # Send email to admin
-            subject = f"User Contact Request - Conversation {conversation_id}"
-            body = f"""
-A user wants to contact you through the chat application.
 
-Conversation ID: {conversation_id}
-Model Used: {GROQ_MODEL}
-Message: {contact_message}
+        # Initialise conversation list if new
+        conv_history = conversations.setdefault(conversation_id, [])
+        conv_history.append({"role": "user", "content": message})
+        conv_history.append({"role": "assistant", "content": chat_response})
 
-Full conversation history:
-{json.dumps(conversations.get(conversation_id, []), indent=2)}
-            """
-            
-            email_sent = send_email(subject, body, user_email)
-            
-            if email_sent:
-                response_msg = "Thank you for your message! I've forwarded it to the admin and they'll get back to you soon."
+        # Store some lightweight metadata (timestamp of last activity)
+        conversation_metadata[conversation_id] = {
+            "updated_at": datetime.now()
+        }
+
+        # Handle contact intent – ensure we have enough info before sending email
+        if detect_contact_intent(message):
+            contact_info = extract_contact_info(message)
+            contact_message = extract_contact_message(message)
+            visitor_email = contact_info.get("email") or user_email
+            visitor_name = contact_info.get("name")
+
+            if not visitor_email:
+                chat_response = (
+                    "I'd be happy to pass your message along to Abu Sayed. "
+                    "Could you please provide your email address or other info so he can get back to you?"
+                )
             else:
-                response_msg = "I understand you want to contact the admin, but there was an issue sending your message. Please try again later."
-            
-            return jsonify(ChatResponse(
-                response=response_msg,
-                conversation_id=conversation_id
-            ).to_dict())
-        
-        # Add user message to conversation
-        conversations[conversation_id].append({
-            'role': 'user',
-            'content': user_message,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        # Prepare messages for API call
-        messages = [
-            {
-                'role': 'system', 
-                'content': f'You are a helpful AI assistant powered by {GROQ_MODEL}. You are fast, efficient, and knowledgeable. If a user wants to contact the developer or admin, let them know they can say something like "I want to contact you" or "send message to admin".'
-            }
-        ]
-        
-        # Add conversation history (limit to last 10 messages to avoid token limits)
-        conversation_history = conversations[conversation_id][-10:]
-        for msg in conversation_history:
-            messages.append({
-                'role': msg['role'],
-                'content': msg['content']
-            })
-        
-        # Make API call to Groq
-        ai_response = call_groq_api(messages)
-        
-        # Add AI response to conversation
-        conversations[conversation_id].append({
-            'role': 'assistant',
-            'content': ai_response,
-            'timestamp': datetime.now().isoformat(),
-            'model': GROQ_MODEL
-        })
-        
+                send_contact_email(visitor_email, contact_message, name=visitor_name)
+                chat_response += (
+                    "\n\nYour message has been sent to Abu Sayed. "
+                    "Thank you for reaching out - he will respond as soon as possible."
+                )
+
         return jsonify(ChatResponse(
-            response=ai_response,
+            response=chat_response ,
             conversation_id=conversation_id
         ).to_dict())
-        
     except Exception as e:
         print(f"Chat endpoint error: {str(e)}")
         return jsonify(ChatResponse(
@@ -297,6 +305,44 @@ def delete_conversation(conversation_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/conversations', methods=['GET'])
+def format_conversation_snapshot(conv_id: str) -> str:
+    """Return a plain-text snapshot of the full conversation."""
+    messages = conversations.get(conv_id, [])
+    lines = [f"Conversation ID: {conv_id}", "="*40]
+    for idx, msg in enumerate(messages, 1):
+        role = msg.get("role", "unknown").title()
+        content = msg.get("content", "")
+        lines.append(f"{idx}. [{role}] {content}")
+    return "\n".join(lines)
+
+
+@app.route('/api/end-conversation', methods=['POST'])
+def end_conversation():
+    """Mark a conversation as finished and email snapshot to admin."""
+    try:
+        print("End conversation endpoint called")
+        data = request.get_json()
+        conv_id = data.get("conversation_id")
+        visitor_email = data.get("user_email")
+        print(conv_id, visitor_email)
+
+        if not conv_id or conv_id not in conversations:
+            return jsonify({"error": "Conversation not found"}), 404
+
+        snapshot_text = format_conversation_snapshot(conv_id)
+        send_email(
+            subject=f"Conversation snapshot {conv_id}",
+            body=snapshot_text,
+            user_email=visitor_email,
+        )
+        # Optionally mark as archived/finished
+        conversation_metadata.setdefault(conv_id, {})["ended_at"] = datetime.now()
+
+        return jsonify({"status": "snapshot_sent"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def list_conversations():
     """List all conversations"""
     try:
@@ -345,7 +391,7 @@ def test_api():
             'error': str(e)
         }), 500
 
-@app.route('/api/models', methods=['GET'])
+@app.route('/api/models', methods=['POST'])
 def list_models():
     """List available Groq models"""
     try:

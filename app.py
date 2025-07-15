@@ -170,6 +170,7 @@ def extract_contact_message(message: str) -> str:
 @app.route('/api/chat', methods=['POST'])
 def chat():
     try:
+        print(request.data)
         data = request.get_json()
         
         if not data or 'message' not in data:

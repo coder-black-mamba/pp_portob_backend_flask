@@ -9,12 +9,16 @@ import uuid
 from datetime import datetime
 import json
 from typing import Dict, List, Optional
+import dotenv
+
+dotenv.load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
 # Configuration - Add these to your environment variables
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', 'your-groq-api-key')
+
 # Using the latest Llama model available - update to llama-4 when available
 GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.1-70b-versatile')
 
@@ -28,6 +32,7 @@ ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@example.com')
 # Initialize Groq client
 try:
     groq_client = Groq(api_key=GROQ_API_KEY)
+    print(GROQ_API_KEY)
     print("✅ Groq client initialized successfully")
 except Exception as e:
     print(f"❌ Failed to initialize Groq client: {e}")
